@@ -1,0 +1,17 @@
+services:
+  backend:
+    build: ./backend
+    ports:
+      - "10200:10200"
+    volumes:
+      - wishclaim_data:/data
+    environment:
+      DATA_DIR: /data
+  frontend:
+    build: ./frontend
+    ports:
+      - "5200:80"
+    depends_on:
+      - backend
+volumes:
+  wishclaim_data:
