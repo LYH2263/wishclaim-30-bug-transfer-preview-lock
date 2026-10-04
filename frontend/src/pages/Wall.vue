@@ -11,7 +11,7 @@
           认领人 {{ w.claimer || '—' }} · 倒计时 {{ fmtCountdown(w.expires_at, tick) }}
         </p>
         <p v-if="w.pending_transfer" class="tag transfer-tag">
-          认领人 {{ w.claimer }} · 转让中 {{ w.pending_transfer.from_claimer }} → {{ w.pending_transfer.target_claimer }}
+          转让托管中（未确认，认领人仍为 {{ w.pending_transfer.from_claimer }}）：{{ w.pending_transfer.from_claimer }} → {{ w.pending_transfer.target_claimer }}
         </p>
       </article>
     </div>

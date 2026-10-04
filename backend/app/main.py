@@ -4,7 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from app import seed
 from app.db import connect
-from app.engines.claim_lock import claim_allowed, lock_payload, release_if_expired
+from app.engines.claim_lock import release_if_expired
 from app.modules.claim_transfer import locking as transfer_lock
 from app.modules.claim_transfer.preview import TTL_POLICY
 from app.modules.claim_transfer.projection import project_card
@@ -65,19 +65,12 @@ class ClaimIn(BaseModel):
 @app.post("/api/wishes/{wid}/claim")
 def claim(wid: int, body: ClaimIn):
     c = connect(); sweep(c); c.commit()
-    r = c.execute("SELECT * FROM wishes WHERE id=?", (wid,)).fetchone()
-    if not r: c.close(); raise HTTPException(404, "not found")
-    # 托管中：存在未确认转让单时，任何人都不能直接 claim，目标人须走确认。
-    blocked = transfer_lock.claim_blocked_by_pending(c, wid, body.claimer)
-    if blocked:
-        c.close(); raise HTTPException(409, blocked["reason"])
-    allowed = claim_allowed(r["status"], r["claimer"], now(), r["expires_at"])
-    if not allowed["ok"]:
-        c.close(); raise HTTPException(409, allowed["reason"])
-    p = lock_payload(body.claimer, now(), ttl())
-    c.execute("UPDATE wishes SET status=?, claimer=?, claimed_at=?, expires_at=? WHERE id=?",
-              (p["status"], p["claimer"], p["claimed_at"], p["expires_at"], wid))
-    c.commit(); c.close(); return p
+    # 写锁内同时复查 TTL/状态与转让托管：未确认转让单存在时任何人（含目标人）
+    # 都不能直接认领；与确认并发时两者抢同一把写锁，杜绝两人同时 claimed。
+    res = transfer_lock.claim_wish(c, wid, body.claimer, now(), ttl())
+    if not res["ok"]:
+        c.close(); _fail(res)
+    c.close(); return res
 
 @app.post("/api/wishes/{wid}/release")
 def release(wid: int):
@@ -111,6 +104,7 @@ _TF_STATUS = {
     "not_owner": 403, "not_target": 403,
     "pending_transfer": 409, "transfer_not_pending": 409,
     "wish_not_claimed": 409,
+    "locked": 409, "already_fulfilled": 409, "bad_status": 409,
 }
 
 def _fail(res: dict):
@@ -123,7 +117,7 @@ def transfer_preview(wid: int, body: TransferIn):
     res = transfer_lock.offer_transfer(c, wid, body.claimer, body.target, now(), ttl())
     if not res["ok"]:
         c.close(); _fail(res)
-    c.commit(); c.close(); return res
+    c.close(); return res
 
 class TransferConfirmIn(BaseModel):
     claimer: str
@@ -144,14 +138,15 @@ def transfer_cancel(tid: int, body: TransferConfirmIn):
     res = transfer_lock.cancel_transfer(c, tid, body.claimer)
     if not res["ok"]:
         c.close(); _fail(res)
-    c.commit(); c.close(); return {"ok": True, **res}
+    c.close(); return res
 
 @app.get("/api/mine")
 def mine(claimer: str):
     c = connect(); sweep(c); c.commit()
+    # 单一口径：只认 wishes.claimer。托管期间锁仍在原认领人名下（target 确认前
+    # 不占行）；确认成功后才整体换到新认领人名下，禁止两边都挂着同一行。
     rows = [project(c, r) for r in c.execute(
-        "SELECT * FROM wishes WHERE claimer=? OR id IN (SELECT wish_id FROM claim_transfers WHERE status='pending' AND (from_claimer=? OR target_claimer=?))",
-        (claimer, claimer, claimer))]
+        "SELECT * FROM wishes WHERE claimer=? ORDER BY id DESC", (claimer,))]
     c.close(); return rows
 
 @app.get("/api/done")

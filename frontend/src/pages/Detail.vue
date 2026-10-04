@@ -8,7 +8,7 @@
     </p>
     <p v-if="w.pending_transfer" class="tag transfer-tag">
       转让托管中：{{ w.pending_transfer.from_claimer }} → {{ w.pending_transfer.target_claimer }}
-      （确认后 TTL 自转让时刻重开满额）
+      （未确认，认领人与倒计时不变；确认成功后认领人换人、TTL 自确认时刻重开满额）
     </p>
     <p v-if="err" class="err">{{ errText(err) }}</p>
     <input v-model="claimer" placeholder="你的名字" />
