@@ -6,7 +6,8 @@
       <h3>{{ w.title }}</h3>
       <span class="tag">{{ w.status }} · 到期 {{ w.expires_at }} · 剩余 {{ fmtCountdown(w.expires_at, tick) }}</span>
       <p v-if="w.pending_transfer" class="tag transfer-tag">
-        转让中：等待 {{ w.pending_transfer.target_claimer }} 确认（确认后此行将从「我的认领」移除，钉到新认领人名下）
+        转让托管中：等待 {{ w.pending_transfer.target_claimer }} 确认；确认前锁仍归你独占（他人无法认领），
+        确认成功后此行整行移到 {{ w.pending_transfer.target_claimer }} 名下并满额重开倒计时
       </p>
     </article>
     <p v-if="!rows.length" class="tag">暂无认领</p>

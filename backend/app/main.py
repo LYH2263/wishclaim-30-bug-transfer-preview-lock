@@ -64,20 +64,44 @@ class ClaimIn(BaseModel):
 
 @app.post("/api/wishes/{wid}/claim")
 def claim(wid: int, body: ClaimIn):
-    c = connect(); sweep(c); c.commit()
-    r = c.execute("SELECT * FROM wishes WHERE id=?", (wid,)).fetchone()
-    if not r: c.close(); raise HTTPException(404, "not found")
-    # 托管中：存在未确认转让单时，任何人都不能直接 claim，目标人须走确认。
-    blocked = transfer_lock.claim_blocked_by_pending(c, wid, body.claimer)
-    if blocked:
-        c.close(); raise HTTPException(409, blocked["reason"])
-    allowed = claim_allowed(r["status"], r["claimer"], now(), r["expires_at"])
-    if not allowed["ok"]:
-        c.close(); raise HTTPException(409, allowed["reason"])
-    p = lock_payload(body.claimer, now(), ttl())
-    c.execute("UPDATE wishes SET status=?, claimer=?, claimed_at=?, expires_at=? WHERE id=?",
-              (p["status"], p["claimer"], p["claimed_at"], p["expires_at"], wid))
-    c.commit(); c.close(); return p
+    # 空名守卫：绝不允许把锁写死给空名（非法受让人同理在 offer 内拦截）。
+    name = (body.claimer or "").strip()
+    if not name:
+        raise HTTPException(400, "empty_claimer")
+    nowv, ttlv = now(), ttl()
+    c = connect()
+    c.isolation_level = None  # explicit transaction control
+    try:
+        # IMMEDIATE 写锁内完成「过期清扫 → escrow 检查 → 认领写入」，
+        # 与并发的 transfer offer / confirm 串行化，杜绝穿透与双占。
+        c.execute("BEGIN IMMEDIATE")
+        sweep(c)
+        r = c.execute("SELECT * FROM wishes WHERE id=?", (wid,)).fetchone()
+        if not r:
+            c.execute("COMMIT")  # keep sweep's expiry releases
+            raise HTTPException(404, "not found")
+        # 托管中：存在未确认转让单时，任何人都不能直接 claim，目标人须走确认。
+        blocked = transfer_lock.claim_blocked_by_pending(c, wid, name)
+        if blocked:
+            c.execute("COMMIT")
+            raise HTTPException(409, blocked["reason"])
+        allowed = claim_allowed(r["status"], r["claimer"], nowv, r["expires_at"])
+        if not allowed["ok"]:
+            c.execute("COMMIT")
+            raise HTTPException(409, allowed["reason"])
+        p = lock_payload(name, nowv, ttlv)
+        c.execute("UPDATE wishes SET status=?, claimer=?, claimed_at=?, expires_at=? WHERE id=?",
+                  (p["status"], p["claimer"], p["claimed_at"], p["expires_at"], wid))
+        c.execute("COMMIT")
+    except HTTPException:
+        raise
+    except Exception:
+        c.execute("ROLLBACK")
+        raise
+    finally:
+        c.isolation_level = ""
+        c.close()
+    return p
 
 @app.post("/api/wishes/{wid}/release")
 def release(wid: int):
@@ -108,6 +132,7 @@ class TransferIn(BaseModel):
 # 失败原因 -> HTTP 状态码
 _TF_STATUS = {
     "not_found": 404, "not_claimed": 400, "invalid_target": 400,
+    "ttl_expired": 409, "empty_claimer": 400,
     "not_owner": 403, "not_target": 403,
     "pending_transfer": 409, "transfer_not_pending": 409,
     "wish_not_claimed": 409,
@@ -118,40 +143,61 @@ def _fail(res: dict):
 
 @app.post("/api/wishes/{wid}/transfer")
 def transfer_preview(wid: int, body: TransferIn):
-    """当前认领人发起转让：生成 pending 转让单并返回预览（不改 wishes）。"""
-    c = connect(); sweep(c); c.commit()
-    res = transfer_lock.offer_transfer(c, wid, body.claimer, body.target, now(), ttl())
+    """当前认领人发起转让：生成 pending 转让单并返回预览（不改 wishes）。
+
+    offer_transfer 自管 BEGIN IMMEDIATE；这里不做 sweep/commit。
+    """
+    c = connect()
+    try:
+        res = transfer_lock.offer_transfer(c, wid, (body.claimer or "").strip(), body.target, now(), ttl())
+    finally:
+        c.close()
     if not res["ok"]:
-        c.close(); _fail(res)
-    c.commit(); c.close(); return res
+        _fail(res)
+    return res
 
 class TransferConfirmIn(BaseModel):
     claimer: str
 
 @app.post("/api/transfers/{tid}/confirm")
 def transfer_confirm(tid: int, body: TransferConfirmIn):
-    """目标人确认：写锁内换 claimer，TTL 自转让时刻重开满额。"""
+    """目标人确认：写锁内换 claimer，TTL 自确认时刻重开满额。
+
+    confirm_transfer 自管 BEGIN IMMEDIATE（成功 COMMIT / 失败 ROLLBACK）。
+    """
     c = connect()
-    res = transfer_lock.confirm_transfer(c, tid, body.claimer, now(), ttl())
+    try:
+        res = transfer_lock.confirm_transfer(c, tid, (body.claimer or "").strip(), now(), ttl())
+    finally:
+        c.close()
     if not res["ok"]:
-        c.close(); _fail(res)
-    c.close(); return res
+        _fail(res)
+    return res
 
 @app.post("/api/transfers/{tid}/cancel")
 def transfer_cancel(tid: int, body: TransferConfirmIn):
-    """原认领人撤销未确认的转让单。"""
+    """原认领人撤销未确认的转让单；锁一直没动过，撤销后仍由原主独占。"""
     c = connect()
-    res = transfer_lock.cancel_transfer(c, tid, body.claimer)
+    try:
+        res = transfer_lock.cancel_transfer(c, tid, (body.claimer or "").strip())
+    finally:
+        c.close()
     if not res["ok"]:
-        c.close(); _fail(res)
-    c.commit(); c.close(); return {"ok": True, **res}
+        _fail(res)
+    return {"ok": True, **res}
 
 @app.get("/api/mine")
 def mine(claimer: str):
+    name = (claimer or "").strip()
     c = connect(); sweep(c); c.commit()
-    rows = [project(c, r) for r in c.execute(
-        "SELECT * FROM wishes WHERE claimer=? OR id IN (SELECT wish_id FROM claim_transfers WHERE status='pending' AND (from_claimer=? OR target_claimer=?))",
-        (claimer, claimer, claimer))]
+    # 口径：锁独占——wishes.claimer 是唯一持锁人。pending 期间行只在原认领人
+    # 名下（目标人确认前不占行）；确认成功后才整体落到新认领人名下。
+    # 目标人通过墙卡/详情的托管标记确认，不在此预占。
+    if name:
+        rows = [project(c, r) for r in c.execute(
+            "SELECT * FROM wishes WHERE claimer=? ORDER BY id DESC", (name,))]
+    else:
+        rows = []
     c.close(); return rows
 
 @app.get("/api/done")
